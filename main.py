@@ -1,248 +1,256 @@
+import asyncio
 import os
-from queue import Queue
+import re
+import logging
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
 
-import telebot
+from aiogram import Bot, Dispatcher
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import (
+    Message,
+    ChatJoinRequest,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ErrorEvent,
+)
+from aiogram.client.default import DefaultBotProperties
 
-import storage
-from config import TOKEN, ADMIN_ID, TEMP_DIR
-import utils
-import admin as admin_mod
-from workers import start_workers
-from media import download_video, make_unique
-
-os.makedirs(TEMP_DIR, exist_ok=True)
-
-bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
-task_queue: "Queue[dict]" = Queue()
-
-storage.load_state()
-utils.start_temp_cleaner()
-start_workers(bot, task_queue)
-
-
-def add_user_and_notify(message_or_call):
-    chat_id = message_or_call.chat.id
-    username = getattr(message_or_call.from_user, "username", None)
-    is_new = storage.add_or_update_user(chat_id, username, default_lang="ru")
-    if is_new:
-        try:
-            bot.send_message(ADMIN_ID, utils.t(ADMIN_ID, "new_user", id=chat_id, username=(username or "no_username")))
-        except Exception:
-            pass
+import aiosqlite
+from dotenv import load_dotenv
 
 
-@bot.message_handler(commands=["start"])
-def cmd_start(message):
-    add_user_and_notify(message)
-    chat_id = message.chat.id
+# =========================
+# CONFIG
+# =========================
+load_dotenv()
 
-    if utils.is_admin(chat_id):
-        bot.send_message(chat_id, utils.t(chat_id, "welcome_menu"), reply_markup=utils.main_menu_markup(chat_id))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ID = int(os.getenv("CHANNEL_ID")) if os.getenv("CHANNEL_ID") else None
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN not set")
+
+
+# =========================
+# ADMINS (можно прямо в коде)
+# =========================
+DEFAULT_ADMINS = {
+    8153596056,  # <-- ВПИШИ СВОЙ TELEGRAM ID
+}
+
+ADMIN_IDS = set(
+    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
+) or DEFAULT_ADMINS
+
+
+# =========================
+# CONSTANTS
+# =========================
+DB_PATH = "bot.db"
+BROADCAST_RPS = 20
+
+WELCOME_DEFAULT_TEXT = "Привет! 👋\nСпасибо за заявку."
+WELCOME_DEFAULT_BUTTON_TEXT = "Открыть"
+WELCOME_DEFAULT_BUTTON_URL = "https://t.me/"
+
+
+# =========================
+# HELPERS
+# =========================
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
+
+
+# =========================
+# DATABASE
+# =========================
+async def db_init():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA synchronous=NORMAL;")
+        await db.execute("PRAGMA busy_timeout=5000;")
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            is_blocked INTEGER DEFAULT 0
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS welcome (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            media_type TEXT,
+            media_file_id TEXT,
+            text TEXT,
+            button_text TEXT,
+            button_url TEXT
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS admin_state (
+            admin_id INTEGER PRIMARY KEY,
+            state TEXT
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS broadcast_lock (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            is_running INTEGER
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            is_enabled INTEGER
+        )
+        """)
+
+        await db.execute("""
+        INSERT OR IGNORE INTO welcome VALUES
+        (1, NULL, NULL, ?, ?, ?)
+        """, (WELCOME_DEFAULT_TEXT, WELCOME_DEFAULT_BUTTON_TEXT, WELCOME_DEFAULT_BUTTON_URL))
+
+        await db.execute("INSERT OR IGNORE INTO broadcast_lock VALUES (1,0)")
+        await db.execute("INSERT OR IGNORE INTO settings VALUES (1,1)")
+
+        await db.commit()
+
+
+# =========================
+# SETTINGS
+# =========================
+async def get_enabled() -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT is_enabled FROM settings WHERE id=1")
+        return bool((await cur.fetchone())[0])
+
+
+async def set_enabled(v: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE settings SET is_enabled=?", (1 if v else 0,))
+        await db.commit()
+
+
+# =========================
+# WELCOME
+# =========================
+@dataclass
+class Welcome:
+    media_type: Optional[str]
+    media_id: Optional[str]
+    text: str
+    btn_text: str
+    btn_url: str
+
+
+async def get_welcome() -> Welcome:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT media_type, media_file_id, text, button_text, button_url
+            FROM welcome WHERE id=1
+        """)
+        return Welcome(*await cur.fetchone())
+
+
+async def send_welcome(bot: Bot, uid: int):
+    w = await get_welcome()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=w.btn_text, url=w.btn_url)]
+    ])
+
+    if w.media_type == "photo":
+        await bot.send_photo(uid, w.media_id, caption=w.text, reply_markup=kb)
+    elif w.media_type == "video":
+        await bot.send_video(uid, w.media_id, caption=w.text, reply_markup=kb)
+    else:
+        await bot.send_message(uid, w.text, reply_markup=kb)
+
+
+# =========================
+# KEYBOARDS
+# =========================
+async def kb_admin():
+    enabled = await get_enabled()
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🟢 Включен" if enabled else "🔴 Выключен")],
+            [KeyboardButton(text="📌 Приветствие")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+# =========================
+# HANDLERS
+# =========================
+async def on_join(event: ChatJoinRequest, bot: Bot):
+    if not await get_enabled():
+        return
+    if CHANNEL_ID and event.chat.id != CHANNEL_ID:
+        return
+    await send_welcome(bot, event.user_chat_id)
+
+
+async def cmd_start(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    await msg.answer("Админка 👇", reply_markup=await kb_admin())
+
+
+async def admin_router(msg: Message):
+    if msg.chat.type != "private":
+        return
+    if not is_admin(msg.from_user.id):
         return
 
-    # обычным — выбор языка
-    bot.send_message(chat_id, utils.t(chat_id, "choose_lang"), reply_markup=utils.lang_markup())
+    text = (msg.text or "").strip()
+
+    if text in ("🟢 Включен", "🔴 Выключен"):
+        await set_enabled(not await get_enabled())
+        return await msg.answer("Готово", reply_markup=await kb_admin())
+
+    if text == "❌ Отмена":
+        return await msg.answer("Отменено", reply_markup=await kb_admin())
 
 
-@bot.message_handler(commands=["admin"])
-def cmd_admin(message):
-    add_user_and_notify(message)
-    chat_id = message.chat.id
-
-    if not utils.is_admin(chat_id):
-        bot.send_message(chat_id, utils.t(chat_id, "not_admin"))
-        return
-
-    bot.send_message(chat_id, utils.t(chat_id, "admin_panel"), reply_markup=utils.admin_markup(chat_id, broadcast_running=admin_mod.broadcast_control["running"]))
+# =========================
+# ERROR HANDLER
+# =========================
+async def on_error(event: ErrorEvent):
+    logging.exception(event.exception)
+    return True
 
 
-@bot.message_handler(commands=["cancel"])
-def cmd_cancel(message):
-    chat_id = message.chat.id
-    if utils.is_admin(chat_id) and admin_mod.admin_state.get(chat_id) == "await_broadcast":
-        admin_mod.admin_state.pop(chat_id, None)
-        bot.send_message(chat_id, utils.t(chat_id, "broadcast_cancelled"))
-        return
-    bot.send_message(chat_id, "OK.")
+# =========================
+# START
+# =========================
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    await db_init()
+
+    bot = Bot(
+        BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+
+    dp = Dispatcher()
+    dp.errors.register(on_error)
+
+    dp.chat_join_request.register(on_join)
+    dp.message.register(cmd_start, Command("start"))
+    dp.message.register(admin_router)
+
+    await dp.start_polling(bot)
 
 
-@bot.callback_query_handler(func=lambda call: True)
-def callbacks(call):
-    # last_seen обновляем
-    storage.add_or_update_user(call.message.chat.id, call.from_user.username, default_lang="ru")
-
-    chat_id = call.message.chat.id
-    data = call.data or ""
-
-    # выбор языка (обычным)
-    if data.startswith("lang|") and not utils.is_admin(chat_id):
-        lang = data.split("|", 1)[1]
-        if lang in ("ru", "en"):
-            storage.set_lang(chat_id, lang)
-        bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, utils.t(chat_id, "welcome_menu"), reply_markup=utils.main_menu_markup(chat_id))
-        return
-
-    # меню
-    if data.startswith("menu|"):
-        action = data.split("|", 1)[1]
-        bot.answer_callback_query(call.id)
-        if action == "download":
-            utils.user_mode[chat_id] = "download"
-            bot.send_message(chat_id, utils.t(chat_id, "send_link_download"))
-        elif action == "unique":
-            utils.user_mode[chat_id] = "unique"
-            bot.send_message(chat_id, utils.t(chat_id, "send_link_unique"))
-        return
-
-    # админка
-    if data.startswith("admin|"):
-        if not utils.is_admin(chat_id):
-            bot.answer_callback_query(call.id, utils.t(chat_id, "not_admin"))
-            return
-
-        action = data.split("|", 1)[1]
-        bot.answer_callback_query(call.id)
-
-        if action == "stats":
-            users_count, stats = storage.get_stats_snapshot()
-            active_24h = storage.count_active(24 * 3600)
-            active_7d = storage.count_active(7 * 24 * 3600)
-            active_30d = storage.count_active(30 * 24 * 3600)
-
-            bot.send_message(
-                chat_id,
-                utils.t(
-                    chat_id, "stats",
-                    users=users_count,
-                    active_24h=active_24h,
-                    active_7d=active_7d,
-                    active_30d=active_30d,
-                    downloads=stats.get("downloads", 0),
-                    uniques=stats.get("uniques", 0),
-                    blocked=stats.get("blocked", 0),
-                ),
-                reply_markup=utils.admin_markup(chat_id, broadcast_running=admin_mod.broadcast_control["running"]),
-            )
-            return
-
-        if action == "broadcast":
-            admin_mod.admin_state[chat_id] = "await_broadcast"
-            bot.send_message(chat_id, utils.t(chat_id, "broadcast_start"))
-            return
-
-        if action == "cancel_broadcast":
-            if admin_mod.broadcast_control["running"]:
-                admin_mod.broadcast_control["cancel"] = True
-                bot.send_message(chat_id, utils.t(chat_id, "broadcast_cancelled"))
-            return
-
-        return
-
-    # "Уникализировать?" после отправки оригинала
-    if data.startswith(("postuniq_yes|", "postuniq_no|")):
-        action, token = data.split("|", 1)
-        bot.answer_callback_query(call.id)
-
-        sess = utils.sessions.get(chat_id)
-        if not sess or sess.get("token") != token:
-            bot.send_message(chat_id, utils.t(chat_id, "session_expired"))
-            utils.sessions.pop(chat_id, None)
-            return
-
-        if action == "postuniq_no":
-            utils.sessions.pop(chat_id, None)
-            return
-
-        # YES: скачать заново -> уник -> отправить -> удалить
-        url = sess["url"]
-        utils.sessions.pop(chat_id, None)
-
-        # антиспам
-        with utils.busy_lock:
-            if chat_id in utils.user_busy:
-                bot.send_message(chat_id, utils.t(chat_id, "busy"))
-                return
-            utils.user_busy.add(chat_id)
-
-        status = utils.safe_send_message(bot, chat_id, utils.t(chat_id, "unique_processing"))
-        in_path = os.path.join(TEMP_DIR, f"in_{chat_id}_{os.urandom(4).hex()}.mp4")
-        out_path = os.path.join(TEMP_DIR, f"out_{chat_id}_{os.urandom(4).hex()}.mp4")
-
-        try:
-            utils.cleanup_temp_dir()
-            download_video(url, in_path)
-            make_unique(in_path, out_path)
-            storage.inc_stat("uniques", 1)
-
-            if status:
-                try:
-                    bot.edit_message_text(chat_id=chat_id, message_id=status.message_id, text=utils.t(chat_id, "done"))
-                except Exception:
-                    pass
-
-            with open(out_path, "rb") as f:
-                bot.send_video(chat_id, f, caption=utils.t(chat_id, "unique_caption"))
-
-        except Exception:
-            bot.send_message(chat_id, utils.t(chat_id, "unique_error"))
-
-        finally:
-            for p in (in_path, out_path):
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
-            with utils.busy_lock:
-                utils.user_busy.discard(chat_id)
-
-        return
-
-    bot.answer_callback_query(call.id)
-
-
-@bot.message_handler(func=lambda m: utils.is_supported_url(m.text or ""))
-def handle_url(message):
-    add_user_and_notify(message)
-    chat_id = message.chat.id
-
-    mode = utils.user_mode.get(chat_id)
-    if mode is None:
-        bot.send_message(chat_id, utils.t(chat_id, "welcome_menu"), reply_markup=utils.main_menu_markup(chat_id))
-        return
-
-    # антиспам
-    with utils.busy_lock:
-        if chat_id in utils.user_busy:
-            bot.send_message(chat_id, utils.t(chat_id, "busy"))
-            return
-        utils.user_busy.add(chat_id)
-
-    status = bot.reply_to(message, utils.t(chat_id, "downloading"))
-    task_queue.put({
-        "type": "download_flow",
-        "chat_id": chat_id,
-        "url": (message.text or "").strip(),
-        "status_msg_id": status.message_id,
-        "mode": mode,
-    })
-
-
-@bot.message_handler(func=lambda m: True, content_types=["text"])
-def fallback_text(message):
-    add_user_and_notify(message)
-    chat_id = message.chat.id
-
-    # ввод текста рассылки
-    if utils.is_admin(chat_id) and admin_mod.admin_state.get(chat_id) == "await_broadcast":
-        admin_mod.admin_state.pop(chat_id, None)
-        admin_mod.start_broadcast(bot, chat_id, message.text or "")
-        return
-
-    if not utils.is_supported_url(message.text or ""):
-        bot.send_message(chat_id, utils.t(chat_id, "invalid"))
-
-
-print("Бот запущен...")
-bot.infinity_polling(skip_pending=True)
+if __name__ == "__main__":
+    asyncio.run(main())
