@@ -35,7 +35,7 @@ if not BOT_TOKEN:
 
 # Admins: ENV overrides defaults, otherwise defaults used
 DEFAULT_ADMINS = {
-    123456789,  # <-- PUT YOUR TELEGRAM ID HERE
+    8153596056,  # <-- PUT YOUR TELEGRAM ID HERE
 }
 
 ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()) or DEFAULT_ADMINS
